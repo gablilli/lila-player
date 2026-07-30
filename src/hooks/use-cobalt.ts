@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useState } from "react";
 
 const COBALT_API_URL = "https://cobalt-api.meowing.de/";
 const COBALT_SESSION_URL = "https://cobalt-api.meowing.de/session";
@@ -116,15 +116,33 @@ const solveTurnstile = (
     });
   });
 
+let turnstileContainer: HTMLDivElement | null = null;
+
+const getTurnstileContainer = (): HTMLDivElement => {
+  if (turnstileContainer && document.body.contains(turnstileContainer)) {
+    return turnstileContainer;
+  }
+  const container = document.createElement("div");
+  container.id = "cobalt-turnstile-container";
+  container.style.position = "fixed";
+  container.style.bottom = "16px";
+  container.style.right = "16px";
+  container.style.zIndex = "2147483647";
+  document.body.appendChild(container);
+  turnstileContainer = container;
+  return container;
+};
+
 let cachedToken: { token: string; exp: number } | null = null;
 
-const getSessionToken = async (container: HTMLElement): Promise<string> => {
+const getSessionToken = async (): Promise<string> => {
   if (cachedToken && cachedToken.exp > Date.now() / 1000 + 5) {
     return cachedToken.token;
   }
 
   await loadTurnstileScript();
   const sitekey = await getSitekey();
+  const container = getTurnstileContainer();
   const turnstileResponse = await solveTurnstile(container, sitekey);
 
   const response = await fetch(COBALT_SESSION_URL, {
@@ -157,7 +175,6 @@ const requestCobalt = async (sourceUrl: string, token: string) =>
   });
 
 export const useCobaltImport = () => {
-  const turnstileContainerRef = useRef<HTMLDivElement | null>(null);
   const [isImporting, setIsImporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -168,16 +185,12 @@ export const useCobaltImport = () => {
       setIsImporting(true);
       setError(null);
       try {
-        if (!turnstileContainerRef.current) {
-          throw new Error("Turnstile container is not mounted");
-        }
-
-        const token = await getSessionToken(turnstileContainerRef.current);
+        const token = await getSessionToken();
         let apiResponse = await requestCobalt(sourceUrl, token);
 
         if (apiResponse.status === 401 || apiResponse.status === 403) {
           cachedToken = null;
-          const freshToken = await getSessionToken(turnstileContainerRef.current);
+          const freshToken = await getSessionToken();
           apiResponse = await requestCobalt(sourceUrl, freshToken);
         }
 
@@ -231,5 +244,5 @@ export const useCobaltImport = () => {
     [],
   );
 
-  return { importFromUrl, isImporting, error, setError, turnstileContainerRef };
+  return { importFromUrl, isImporting, error, setError };
 };
