@@ -2,7 +2,7 @@
 
 import { useCallback, useState } from "react";
 
-const COBALT_API_URL = "https://api.cobalt.tools/";
+const COBALT_API_URL = "https://subito-c.meowing.de/";
 
 interface CobaltResponse {
   status: "tunnel" | "redirect" | "picker" | "error" | "local-processing";
