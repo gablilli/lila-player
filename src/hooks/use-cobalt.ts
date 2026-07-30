@@ -1,8 +1,22 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 
 const COBALT_API_URL = "https://cobalt-api.meowing.de/";
+const COBALT_SESSION_URL = "https://cobalt-api.meowing.de/session";
+const TURNSTILE_SCRIPT_URL = "https://challenges.cloudflare.com/turnstile/v0/api.js";
+
+declare global {
+  interface Window {
+    turnstile?: {
+      render: (
+        container: HTMLElement,
+        options: Record<string, unknown>,
+      ) => string;
+      remove: (widgetId: string) => void;
+    };
+  }
+}
 
 interface CobaltLocalProcessing {
   status: "local-processing";
@@ -47,17 +61,103 @@ const buildPayload = (sourceUrl: string) => ({
   youtubeBetterAudio: true,
 });
 
-const requestCobalt = async (sourceUrl: string) =>
+let turnstileScriptPromise: Promise<void> | null = null;
+
+const loadTurnstileScript = (): Promise<void> => {
+  if (window.turnstile) return Promise.resolve();
+  if (turnstileScriptPromise) return turnstileScriptPromise;
+
+  turnstileScriptPromise = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = TURNSTILE_SCRIPT_URL;
+    script.async = true;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error("Failed to load Turnstile script"));
+    document.head.appendChild(script);
+  });
+
+  return turnstileScriptPromise;
+};
+
+let cachedSitekey: string | null = null;
+
+const getSitekey = async (): Promise<string> => {
+  if (cachedSitekey) return cachedSitekey;
+
+  const response = await fetch(COBALT_API_URL, {
+    headers: { Accept: "application/json" },
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch Cobalt instance info (${response.status})`);
+  }
+  const data = await response.json();
+  const sitekey = data?.cobalt?.turnstileSitekey;
+  if (!sitekey) {
+    throw new Error("Cobalt instance did not return a turnstileSitekey");
+  }
+  cachedSitekey = sitekey;
+  return sitekey;
+};
+
+const solveTurnstile = (
+  container: HTMLElement,
+  sitekey: string,
+): Promise<string> =>
+  new Promise((resolve, reject) => {
+    if (!window.turnstile) {
+      reject(new Error("Turnstile script not loaded"));
+      return;
+    }
+    window.turnstile.render(container, {
+      sitekey,
+      callback: (token: string) => resolve(token),
+      "error-callback": () => reject(new Error("Turnstile challenge failed")),
+      "expired-callback": () => reject(new Error("Turnstile challenge expired")),
+    });
+  });
+
+let cachedToken: { token: string; exp: number } | null = null;
+
+const getSessionToken = async (container: HTMLElement): Promise<string> => {
+  if (cachedToken && cachedToken.exp > Date.now() / 1000 + 5) {
+    return cachedToken.token;
+  }
+
+  await loadTurnstileScript();
+  const sitekey = await getSitekey();
+  const turnstileResponse = await solveTurnstile(container, sitekey);
+
+  const response = await fetch(COBALT_SESSION_URL, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "cf-turnstile-response": turnstileResponse,
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`Cobalt session error (${response.status})`);
+  }
+  const data = await response.json();
+  if (!data.token) {
+    throw new Error("Cobalt session did not return a token");
+  }
+  cachedToken = { token: data.token, exp: Date.now() / 1000 + (data.exp ?? 90) };
+  return cachedToken.token;
+};
+
+const requestCobalt = async (sourceUrl: string, token: string) =>
   fetch(COBALT_API_URL, {
     method: "POST",
     headers: {
       Accept: "application/json",
       "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
     },
     body: JSON.stringify(buildPayload(sourceUrl)),
   });
 
 export const useCobaltImport = () => {
+  const turnstileContainerRef = useRef<HTMLDivElement | null>(null);
   const [isImporting, setIsImporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -68,7 +168,18 @@ export const useCobaltImport = () => {
       setIsImporting(true);
       setError(null);
       try {
-        const apiResponse = await requestCobalt(sourceUrl);
+        if (!turnstileContainerRef.current) {
+          throw new Error("Turnstile container is not mounted");
+        }
+
+        const token = await getSessionToken(turnstileContainerRef.current);
+        let apiResponse = await requestCobalt(sourceUrl, token);
+
+        if (apiResponse.status === 401 || apiResponse.status === 403) {
+          cachedToken = null;
+          const freshToken = await getSessionToken(turnstileContainerRef.current);
+          apiResponse = await requestCobalt(sourceUrl, freshToken);
+        }
 
         if (!apiResponse.ok) {
           throw new Error(`Cobalt API error (${apiResponse.status})`);
@@ -120,5 +231,5 @@ export const useCobaltImport = () => {
     [],
   );
 
-  return { importFromUrl, isImporting, error, setError };
-};  
+  return { importFromUrl, isImporting, error, setError, turnstileContainerRef };
+};
