@@ -3,20 +3,6 @@
 import { useCallback, useState } from "react";
 
 const COBALT_API_URL = "https://cobalt-api.meowing.de/";
-const COBALT_SESSION_URL = "https://cobalt-api.meowing.de/session";
-const TURNSTILE_SCRIPT_URL = "https://challenges.cloudflare.com/turnstile/v0/api.js";
-
-declare global {
-  interface Window {
-    turnstile?: {
-      render: (
-        container: HTMLElement,
-        options: Record<string, unknown>,
-      ) => string;
-      remove: (widgetId: string) => void;
-    };
-  }
-}
 
 interface CobaltLocalProcessing {
   status: "local-processing";
@@ -61,136 +47,27 @@ const buildPayload = (sourceUrl: string) => ({
   youtubeBetterAudio: true,
 });
 
-let turnstileScriptPromise: Promise<void> | null = null;
-
-const loadTurnstileScript = (): Promise<void> => {
-  if (window.turnstile) return Promise.resolve();
-  if (turnstileScriptPromise) return turnstileScriptPromise;
-
-  turnstileScriptPromise = new Promise((resolve, reject) => {
-    const script = document.createElement("script");
-    script.src = TURNSTILE_SCRIPT_URL;
-    script.async = true;
-    script.onload = () => resolve();
-    script.onerror = () => reject(new Error("Failed to load Turnstile script"));
-    document.head.appendChild(script);
-  });
-
-  return turnstileScriptPromise;
-};
-
-let cachedSitekey: string | null = null;
-
-const getSitekey = async (): Promise<string> => {
-  if (cachedSitekey) return cachedSitekey;
-
-  const response = await fetch(COBALT_API_URL, {
-    headers: { Accept: "application/json" },
-  });
-  if (!response.ok) {
-    throw new Error(`Failed to fetch Cobalt instance info (${response.status})`);
-  }
-  const data = await response.json();
-  const sitekey = data?.cobalt?.turnstileSitekey;
-  if (!sitekey) {
-    throw new Error("Cobalt instance did not return a turnstileSitekey");
-  }
-  cachedSitekey = sitekey;
-  return sitekey;
-};
-
-let turnstileContainer: HTMLDivElement | null = null;
-let turnstileWidgetId: string | null = null;
-
-const getTurnstileContainer = (): HTMLDivElement => {
-  if (turnstileContainer && document.body.contains(turnstileContainer)) {
-    return turnstileContainer;
-  }
-  const container = document.createElement("div");
-  container.id = "cobalt-turnstile-container";
-  container.style.position = "fixed";
-  container.style.bottom = "16px";
-  container.style.right = "16px";
-  container.style.zIndex = "2147483647";
-  document.body.appendChild(container);
-  turnstileContainer = container;
-  return container;
-};
-
-const solveTurnstile = async (
-  container: HTMLElement,
-  sitekey: string,
-  maxAttempts = 3,
-): Promise<string> => {
-  let lastError: Error = new Error("Turnstile challenge failed");
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    if (turnstileWidgetId && window.turnstile) {
-      try {
-        window.turnstile.remove(turnstileWidgetId);
-      } catch {}
-      turnstileWidgetId = null;
-    }
-    container.innerHTML = "";
-
-    if (!window.turnstile) {
-      throw new Error("Turnstile script not loaded");
-    }
-
-    try {
-      const token = await new Promise<string>((resolve, reject) => {
-        const widgetId = window.turnstile!.render(container, {
-          sitekey,
-          callback: (t: string) => resolve(t),
-          "error-callback": () =>
-            reject(new Error("Turnstile challenge failed")),
-          "expired-callback": () =>
-            reject(new Error("Turnstile challenge expired")),
-        });
-        turnstileWidgetId = widgetId;
-      });
-      return token;
-    } catch (err) {
-      lastError = err instanceof Error ? err : new Error(String(err));
-      if (attempt < maxAttempts) {
-        await new Promise((r) => setTimeout(r, 1000 * attempt));
-      }
-    }
-  }
-
-  throw lastError;
-};
-
-const TOKEN_EXPIRY_BUFFER_S = 30;
+const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 let cachedToken: { token: string; exp: number } | null = null;
 
 const getSessionToken = async (): Promise<string> => {
-  if (cachedToken && cachedToken.exp > Date.now() / 1000 + TOKEN_EXPIRY_BUFFER_S) {
+  if (cachedToken && cachedToken.exp > Date.now() / 1000 + 30) {
     return cachedToken.token;
   }
 
-  await loadTurnstileScript();
-  const sitekey = await getSitekey();
-  const container = getTurnstileContainer();
-  const turnstileResponse = await solveTurnstile(container, sitekey);
+  let token: string;
 
-  const response = await fetch(COBALT_SESSION_URL, {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "cf-turnstile-response": turnstileResponse,
-    },
-  });
-  if (!response.ok) {
-    throw new Error(`Cobalt session error (${response.status})`);
+  if (isTauri()) {
+    const { invoke } = await import("@tauri-apps/api/core");
+    token = await invoke<string>("get_cobalt_token");
+  } else {
+    const { default: TurnstileFallback } = await import("../utils/turnstile-session");
+    token = await TurnstileFallback();
   }
-  const data = await response.json();
-  if (!data.token) {
-    throw new Error("Cobalt session did not return a token");
-  }
-  cachedToken = { token: data.token, exp: Date.now() / 1000 + (data.exp ?? 90) };
-  return cachedToken.token;
+
+  cachedToken = { token, exp: Date.now() / 1000 + 90 };
+  return token;
 };
 
 const requestCobalt = async (sourceUrl: string, token: string) =>
