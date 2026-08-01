@@ -99,24 +99,8 @@ const getSitekey = async (): Promise<string> => {
   return sitekey;
 };
 
-const solveTurnstile = (
-  container: HTMLElement,
-  sitekey: string,
-): Promise<string> =>
-  new Promise((resolve, reject) => {
-    if (!window.turnstile) {
-      reject(new Error("Turnstile script not loaded"));
-      return;
-    }
-    window.turnstile.render(container, {
-      sitekey,
-      callback: (token: string) => resolve(token),
-      "error-callback": () => reject(new Error("Turnstile challenge failed")),
-      "expired-callback": () => reject(new Error("Turnstile challenge expired")),
-    });
-  });
-
 let turnstileContainer: HTMLDivElement | null = null;
+let turnstileWidgetId: string | null = null;
 
 const getTurnstileContainer = (): HTMLDivElement => {
   if (turnstileContainer && document.body.contains(turnstileContainer)) {
@@ -133,10 +117,56 @@ const getTurnstileContainer = (): HTMLDivElement => {
   return container;
 };
 
+const solveTurnstile = async (
+  container: HTMLElement,
+  sitekey: string,
+  maxAttempts = 3,
+): Promise<string> => {
+  let lastError: Error = new Error("Turnstile challenge failed");
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (turnstileWidgetId && window.turnstile) {
+      try {
+        window.turnstile.remove(turnstileWidgetId);
+      } catch {}
+      turnstileWidgetId = null;
+    }
+    container.innerHTML = "";
+
+    if (!window.turnstile) {
+      throw new Error("Turnstile script not loaded");
+    }
+
+    try {
+      const token = await new Promise<string>((resolve, reject) => {
+        const widgetId = window.turnstile!.render(container, {
+          sitekey,
+          callback: (t: string) => resolve(t),
+          "error-callback": () =>
+            reject(new Error("Turnstile challenge failed")),
+          "expired-callback": () =>
+            reject(new Error("Turnstile challenge expired")),
+        });
+        turnstileWidgetId = widgetId;
+      });
+      return token;
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      if (attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, 1000 * attempt));
+      }
+    }
+  }
+
+  throw lastError;
+};
+
+const TOKEN_EXPIRY_BUFFER_S = 30;
+
 let cachedToken: { token: string; exp: number } | null = null;
 
 const getSessionToken = async (): Promise<string> => {
-  if (cachedToken && cachedToken.exp > Date.now() / 1000 + 5) {
+  if (cachedToken && cachedToken.exp > Date.now() / 1000 + TOKEN_EXPIRY_BUFFER_S) {
     return cachedToken.token;
   }
 
